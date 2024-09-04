@@ -1,0 +1,191 @@
+import os
+import io
+import time
+import h5py
+import base64
+import logging
+import hashlib
+import pickle
+import multiprocessing
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from PIL import Image
+from tqdm import tqdm
+
+from sklearn.metrics import f1_score, confusion_matrix
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+
+import imblearn
+from imblearn.over_sampling import RandomOverSampler
+
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models import resnet50, ResNet50_Weights
+
+from tqdm import tqdm
+
+logging.basicConfig(level=logging.DEBUG,
+                    format='(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    handlers=[logging.StreamHandler()])
+
+# Data paths and parameters
+TRAIN_METADATA_PATH = "/kaggle/input/isic-2024-challenge/train-metadata.csv"
+TRAIN_IMAGE_DIR = '/kaggle/input/isic-2024-challenge/train-image.hdf5'
+
+SUBMISSION_METADATA_PATH = '/kaggle/input/isic-2024-challenge/test-metadata.csv'
+SUBMISSION_IMAGE_PATH = '/kaggle/input/isic-2024-challenge/test-image.hdf5'
+
+BATCH_SIZE = 32
+OVERSAMPLING_RATIO = 0.1 # .1 = 1:10, .2 = 1:5
+    
+# Due to different datatype, need to separate features for processing
+FEATURES = ['age_approx', 'sex', 'anatom_site_general', 'clin_size_long_diam_mm', 'image_type', 'tbp_tile_type']
+NUMERIC_FEATURES = ['age_approx', 'clin_size_long_diam_mm']
+CATEGORICAL_FEATURES = ['sex', 'anatom_site_general', 'image_type', 'tbp_tile_type']
+
+def load_and_preprocess_metadata(metadata_path):
+    """Loads and preprocesses the metadata."""
+    df = pd.read_csv(metadata_path, low_memory=False)
+
+    if 'isic_id' not in df.columns:
+        raise ValueError("CSV file does not contain 'isic_id' column")
+
+    # Fill missing values
+    df['age_approx'] = df['age_approx'].fillna(df['age_approx'].mean())
+    df['sex'] = df['sex'].fillna('unknown')
+    df['anatom_site_general'] = df['anatom_site_general'].fillna('unknown')
+
+    return df
+
+
+# Prepare features using the existing encoder
+def prepare_features(df, encoder):
+    """Prepares features for the model."""
+    df[NUMERIC_FEATURES] = df[NUMERIC_FEATURES].fillna(df[NUMERIC_FEATURES].mean())
+
+    # One-hot encode categorical features using the pre-fitted encoder
+    encoded_features = encoder.transform(df[CATEGORICAL_FEATURES])
+    encoded_feature_names = encoder.get_feature_names_out(CATEGORICAL_FEATURES)
+
+    # Combine numeric and encoded features
+    all_feature_names = NUMERIC_FEATURES + list(encoded_feature_names)
+    feature_array = np.hstack((df[NUMERIC_FEATURES].values, encoded_features))
+    features_df = pd.DataFrame(feature_array, columns=all_feature_names)
+    
+    return features_df, all_feature_names
+
+# Define the Dataset class
+class SkinLesionDataset(Dataset):
+    def __init__(self, hdf5_file, metadata_df, features_df, features, transform=None, return_target=True, use_cache=True, cache_dir='./dataset_cache'):
+        self.hdf5_file = h5py.File(hdf5_file, 'r')
+        self.dataframe = metadata_df
+        self.features_df = features_df
+        self.all_features_names = all_features
+        self.transform = transform
+        self.use_cache = use_cache
+        self.cache_dir = cache_dir
+        self.return_target = return_target
+
+        if self.use_cache:
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.DEBUG)
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        try:
+            if self.use_cache:
+                cache_path = self._get_cache_path(idx)
+                if os.path.exists(cache_path):
+                    item = self._load_from_cache(cache_path)
+                    return item if self.return_target else item[:2]
+                else:
+                    # Load and save to cache
+                    item = self._load_item(idx)
+                    self._save_to_cache(cache_path, item)
+                    return item
+            else:
+                # Caching disabled, just load and transform
+                return self._load_item(idx)
+        except Exception as e:
+            print(f"Error getting item at index {idx}: {e}")
+            self.logger.error(f"Error getting item at index {idx}: {e}")
+            raise
+
+    @staticmethod
+    def positive_transforms(image):
+        positive_transforms = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(30),
+            transforms.ColorJitter(brightness=0.2,
+                                   contrast=0.2, saturation=0.2, hue=0.1)
+        ])
+        return positive_transforms(image)
+    @staticmethod
+    def negative_transforms(image):
+        negative_transforms = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        ])
+        return negative_transforms(image)
+    
+    def _load_item(self, idx):
+        try:
+            image_id = self.dataframe.iloc[idx]['isic_id']
+
+            # HDF5 decoding (using base64 encoding/decoding)
+            image_data = self.hdf5_file[image_id][()]
+            encoded_image_data = base64.b64encode(image_data).decode('ascii')
+            image_bytes = base64.b64decode(encoded_image_data)
+            image = Image.open(io.BytesIO(image_bytes))
+
+            # Apply the transform to the image
+            if self.transform is not None:
+                image = self.transform(image)
+
+            features = torch.tensor(self.features_df.iloc[idx].values, dtype=torch.float)
+
+            # Only return the target if it's required and exists in the dataframe
+            if self.return_target and 'target' in self.dataframe.columns:
+                target_value = self.dataframe.iloc[idx]['target']
+                target = torch.tensor(target_value, dtype=torch.long)
+                return image, features, target
+            else:
+                return image, features
+
+        except Exception as e:
+            self.logger.error(f"Error loading item at index {idx}: {e}")
+            raise
+    def _get_cache_path(self, idx):
+        filename = f"{idx}_{self.dataframe.iloc[idx]['image_filename']}"
+        hashed_filename = hashlib.md5(filename.encode()).hexdigest()
+        return os.path.join(self.cache_dir, f"{hashed_filename}.pkl")
+
+    def _save_to_cache(self, cache_path, item):
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(item, f)
+        except Exception as e:
+            # self.logger.error(f"Error Saving item to disk at index {idx}: {e}")
+            raise
+            
+    def _load_from_cache(self, cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            # self.logger.error(f"Error loading item from cache at index {idx}: {e}")
+            raise
+    def preload(self):
+        for i in tqdm(range(len(self)), desc='Preloading Data'):
+            _ = self[i]
+        # print(f'Preloaded {len(self)} items into cache.')
